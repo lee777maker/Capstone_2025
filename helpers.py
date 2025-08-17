@@ -1,4 +1,5 @@
 import ctypes
+import OpenGL
 from OpenGL.raw.GL.VERSION.GL_1_1 import glGenTextures as raw_glGenTextures
 from OpenGL import GL
 import numpy as np
@@ -22,8 +23,9 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 import pickle
-from shared import shared
 from IPython.display import display, clear_output
+
+shared={}
 
 def warn(*args, **kwargs):
     pass
@@ -109,7 +111,12 @@ def initialize_logging(config_path, is_for_photo):
     shared['config'] = config
 
 def init(config_path, is_for_photo=False):
-    start_resource_monitor()
+    import yaml
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    shared['config'] = cfg
+    if is_for_photo:
+        start_resource_monitor()
     initialize_logging(config_path, is_for_photo)
 
 def show2d(images, path="", dpi=100, layout="h", bgr=False, return_image=False, line_width=2):
@@ -259,11 +266,12 @@ def create_camera_mesh(width=5472, height=3648):
 default_camera_faces, default_camera_face_colors, default_camera_origin, default_camera_edges = create_camera_mesh()
 
 def init_renderer(scale=0.05, load_mesh=False):
-    config = shared['config']
-    fl_mm = config['focal_length_mm']
-    sensor_mm = config['sensor_size_mm']
-    width_px = config['width_px']
-    height_px = config['height_px']
+    config = shared.get('config', {})
+
+    fl_mm = config.get('focal_length_mm', 8.8)
+    sensor_mm = config.get('sensor_size_mm', 13.2)
+    width_px = config.get('width_px', 5472)
+    height_px = config.get('height_px', 3648)
     fl_px = fl_mm / (sensor_mm / width_px)
     pp_x = width_px / 2
     pp_y = height_px / 2
@@ -276,24 +284,14 @@ def init_renderer(scale=0.05, load_mesh=False):
     renderer = pyrender.OffscreenRenderer(viewport_width=s_w, viewport_height=s_h)
     scene = pyrender.Scene(ambient_light=True)
     
-    dataset_path = Path(config['dataset_path'])
     scene_name = config['scene_name']
+    mesh_dir = '.'  # All files in current directory
+    cache_filename = 'cached_scene_LR.pkl' if not load_mesh else 'cached_scene.pkl'
+    mesh_filename = f"{scene_name}.ply" if not load_mesh else f"{scene_name}.obj"
     
-    if load_mesh:
-        mesh_dir = 'Mesh'
-        cache_filename = 'cached_scene.pkl'
-        mesh_filename = f"{scene_name}.obj"
-    else:
-        mesh_dir = 'MeshLR'
-        cache_filename = 'cached_scene_LR.pkl'
-        mesh_filename = f"{scene_name}.ply"
+    cache_scene_path = Path(cache_filename)
+    mesh_path = Path(mesh_filename)
     
-    mesh_dir_path = dataset_path / scene_name / mesh_dir
-    cache_scene_path = mesh_dir_path / cache_filename
-    mesh_path = mesh_dir_path / mesh_filename
-    
-    mesh_dir_path.mkdir(parents=True, exist_ok=True)
-
     if cache_scene_path.exists():
         with cache_scene_path.open('rb') as f:
             scene = pkl.load(f)
@@ -336,16 +334,44 @@ def init_renderer(scale=0.05, load_mesh=False):
     del scene, renderer, cam_params
 
 def render_scene(origin, yaw, pitch):
-    renderer = shared['renderer']
-    scene = shared['scene']
-    camera_pose = compute_camera_pose(origin, yaw, pitch)
-    scene.set_pose(scene.main_camera_node, pose=camera_pose)
-    colormap, depthmap = renderer.render(
-        scene, flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.RGBA)
-    colormap = colormap.copy()
-    colormap[depthmap == 0] = [0, 0, 0, 255]
-    colormap = colormap[:, :, :3].astype(np.uint8)
-    return colormap, depthmap
+    try:
+        # Check if glGenVertexArrays is available
+        if not hasattr(GL, 'glGenVertexArrays') or not GL.glGenVertexArrays:
+            print("OpenGL glGenVertexArrays not supported. Returning placeholder image.")
+            width, height = 640, 480  # Default resolution
+            colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
+            depthmap = np.zeros((height, width), dtype=np.float32)
+            return colormap, depthmap
+
+        renderer = shared.get('renderer')
+        if renderer is None:
+            print("Renderer not initialized. Initializing with default settings.")
+            init_renderer(scale=shared['config'].get('render_scale', 0.5))
+            renderer = shared.get('renderer')
+        scene = shared.get('scene')
+        if scene is None:
+            raise ValueError("Scene not initialized in shared state")
+        
+        camera_pose = compute_camera_pose(origin, yaw, pitch)
+        scene.set_pose(scene.main_camera_node, pose=camera_pose)
+        colormap, depthmap = renderer.render(
+            scene, flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.RGBA)
+        colormap = colormap.copy()
+        colormap[depthmap == 0] = [0, 0, 0, 255]
+        colormap = colormap[:, :, :3].astype(np.uint8)
+        return colormap, depthmap
+    except OpenGL.error.NullFunctionError as e:
+        print(f"OpenGL error: {e}. Returning placeholder image.")
+        width, height = 640, 480
+        colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
+        depthmap = np.zeros((height, width), dtype=np.float32)
+        return colormap, depthmap
+    except Exception as e:
+        print(f"Rendering failed: {e}. Returning placeholder image.")
+        width, height = 640, 480
+        colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
+        depthmap = np.zeros((height, width), dtype=np.float32)
+        return colormap, depthmap
 
 AXES_CONV_TO_TUPLE = {
     'sxyz': (0, 0, 0, 0), 'sxyx': (0, 0, 1, 0), 'sxzy': (0, 1, 0, 0),
@@ -599,23 +625,15 @@ def load_camera_parameters(json_path):
         result['has_route'] = False
     
     return result
-
 def create_route_trace(params):
-    if not params.get('has_route', False):
-        print("No route information found in params")
-        return None
-    
-    waypoint_order = params.get('waypoint_order')
-    if waypoint_order is None:
-        print("Waypoint order not found")
-        return None
+    positions = params['positions']
+    waypoint_order = params.get('waypoint_order', list(range(len(positions))))
+    if not params.get('has_route', False) or waypoint_order is None:
+        print("No route information or waypoint order found. Using default sequential order.")
+        waypoint_order = list(range(len(positions)))
     
     waypoint_order = np.array(waypoint_order)
-    
-    positions = params['positions']
-    
     route_points = positions[waypoint_order]
-    
     n = len(route_points)
     color_idx = np.linspace(0, 1, n)
     
@@ -626,16 +644,16 @@ def create_route_trace(params):
         mode='lines+markers',
         line=dict(
             color=color_idx,
-            colorscale='Plotly3',
+            colorscale=params.get('path_color_scale', 'Plotly3'),
             cmin=0,
             cmax=1,
             showscale=False,
             width=5
         ),
         marker=dict(
-            size=1,  
+            size=1,
             color=color_idx,
-            colorscale='Plotly3',
+            colorscale=params.get('path_color_scale', 'Plotly3'),
             cmin=0,
             cmax=1,
             showscale=False,
@@ -648,7 +666,6 @@ def create_route_trace(params):
     )
     
     return route_trace
-
 def get_custom_colormaps() -> list:
     colormaps = []
     cmasher_cmaps = [
