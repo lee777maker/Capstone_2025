@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QSlider, QLabel, QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox
 )
 
-# Optional: Plotly in Qt via WebEngine (preferred). Fallback to Matplotlib if unavailable.
+# Plotly in Qt via WebEngine
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView
     HAS_WEBENGINE = True
@@ -31,8 +31,7 @@ matplotlib.use("Agg")  # non-interactive backend for canvas rendering
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-# Your helper module (assumed available in your project)
-# If any helper is missing at runtime, guarded calls below will safely continue.
+
 from helpers import (
     init, initialize_logging, load_camera_parameters, generate_camera_3d_thickness,
     render_scene, create_route_trace, init_renderer, shared
@@ -177,7 +176,7 @@ class PlotlyRenderer:
     def get_html(self) -> str:
         return pio.to_html(self.fig, full_html=False, include_plotlyjs='cdn')
 
-    # Fallback extraction for Matplotlib view (if WebEngine not available)
+    # Fallback extraction for Matplotlib view 
     def get_mesh_data(self) -> Optional[dict]:
         for tr in self.fig.data:
             if isinstance(tr, go.Mesh3d):
@@ -205,7 +204,7 @@ class SceneManager:
             pass  # safe fallback if helpers handle their own init
 
     def load_mesh(self, mesh_path: str):
-        # Try to pull mesh from a preloaded pyrender scene if available
+        # pull mesh from a preloaded pyrender scene if available
         try:
             init_renderer(scale=self.config['scene'].get('render_scale', 0.5), load_mesh=False)
             if 'scene' in shared and shared['scene']:
@@ -230,7 +229,7 @@ class SceneManager:
             if not self.mesh.has_vertices():
                 raise ValueError(f"Mesh is empty: {mp}")
 
-        # Simplify/cluster if requested
+        # Simplify
         vx = float(self.config['scene'].get('voxel_size', 0.2))
         if vx and vx > 0:
             try:
@@ -303,7 +302,7 @@ class WaypointParser:
         if not json_path.exists():
             raise FileNotFoundError(f"Waypoint JSON not found: {json_path}")
 
-        # Prefer project helper if available
+    
         try:
             params = load_camera_parameters(str(json_path))
         except Exception:
@@ -344,7 +343,7 @@ class PathVisualizer:
         try:
             path_trace = create_route_trace(params)
         except Exception:
-            # Fallback: simple polyline
+            
             pts = params['positions'][order]
             path_trace = go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
@@ -361,7 +360,7 @@ class PathVisualizer:
                 )
                 camera_traces.extend(cam_objs)
             except Exception:
-                # Fallback: small axis tripod per camera
+                
                 p = wp['position']
                 l = 0.3
                 camera_traces.extend([
@@ -445,7 +444,7 @@ class VisualizationSystem:
         self.trajectory_manager: Optional[Tuple[WaypointParser, PathVisualizer]] = None
         self.render_thread: Optional[RenderThread] = None
 
-    # API used by UI
+    # API 
     def load_scene(self, mesh_path: str):
         self.scene_manager.load_mesh(mesh_path)
         self.scene_manager.plotly_objs.clear()
@@ -476,7 +475,7 @@ class VisualizationSystem:
             parser.parse_json(json_path)
             visualizer = PathVisualizer()
             visualizer.visualize_trajectory(parser.waypoints, parser.order, name=f"Path {i+1}")
-            # Add incrementally to renderer without clearing
+            # Add to renderer without clearing
             current = list(self.renderer.fig.data)
             self.renderer.add_objects(list(current) + visualizer.get_plotly_objects())
         self.renderer.update_layout(title="Trajectory Comparison")
@@ -489,7 +488,7 @@ class VisualizationSystem:
 
     def render_waypoint_view(self, waypoint_index: int, callback):
         if not self.trajectory_manager or not self.trajectory_manager[0]:
-            # No JSON trajectory loaded -> placeholder FPV
+            # if No JSON trajectory loaded -> placeholder FPV
             width, height = 640, 480
             colormap = np.full((height, width, 3), 128, dtype=np.uint8)
             callback(colormap)
@@ -570,7 +569,7 @@ class ViewerApp(QMainWindow):
         left_layout.addWidget(control_widget)
 
         control_layout.addWidget(QLabel("Camera Controls"))
-        # Create sliders from config (no hardcoding)
+        #  sliders from config
         sliders_cfg = self.config['ui'].get('camera_slider_ranges', {})
         self._sliders = {}
         for name, values in sliders_cfg.items():
