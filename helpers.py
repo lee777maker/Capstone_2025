@@ -1,3 +1,7 @@
+# helpers.py
+
+from OpenGL import GL
+from OpenGL import error as OpenGL_error
 import ctypes
 import OpenGL
 from OpenGL.raw.GL.VERSION.GL_1_1 import glGenTextures as raw_glGenTextures
@@ -74,6 +78,12 @@ def start_resource_monitor():
     hbox = widgets.HBox([cpu_container, mem_container, gpu_container])
     clear_output(wait=True)
     display(hbox)
+
+
+    def init_empty_scene():
+        s = pyrender.Scene()
+        shared['scene'] = s
+        return s
 
     def background_update():
         while True:
@@ -333,45 +343,59 @@ def init_renderer(scale=0.05, load_mesh=False):
     
     del scene, renderer, cam_params
 
+
 def render_scene(origin, yaw, pitch):
     try:
-        # Check if glGenVertexArrays is available
-        if not hasattr(GL, 'glGenVertexArrays') or not GL.glGenVertexArrays:
-            print("OpenGL glGenVertexArrays not supported. Returning placeholder image.")
-            width, height = 640, 480  # Default resolution
-            colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
-            depthmap = np.zeros((height, width), dtype=np.float32)
-            return colormap, depthmap
+        from OpenGL import GL
+        import pyrender
+        import numpy as np
+        import trimesh
 
-        renderer = shared.get('renderer')
-        if renderer is None:
-            print("Renderer not initialized. Initializing with default settings.")
-            init_renderer(scale=shared['config'].get('render_scale', 0.5))
-            renderer = shared.get('renderer')
+        renderer = pyrender.OffscreenRenderer(640, 480)
         scene = shared.get('scene')
+
         if scene is None:
-            raise ValueError("Scene not initialized in shared state")
-        
+            # placeholder scene with cube + camera
+            scene = pyrender.Scene()
+            cube = pyrender.Mesh.from_trimesh(
+                trimesh.creation.box(extents=(1, 1, 1))
+            )
+            scene.add(cube)
+
+            #  default perspective camera if none exists
+            camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+            cam_node = scene.add(camera, pose=np.eye(4))
+            scene.main_camera_node = cam_node
+
+            shared['scene'] = scene
+
+        # camera exists before setting pose
+        if getattr(scene, 'main_camera_node', None) is None:
+            camera = pyrender.PerspectiveCamera(yfov=np.pi / 3.0)
+            cam_node = scene.add(camera, pose=np.eye(4))
+            scene.main_camera_node = cam_node
+
+        # computed camera pose
         camera_pose = compute_camera_pose(origin, yaw, pitch)
         scene.set_pose(scene.main_camera_node, pose=camera_pose)
+
         colormap, depthmap = renderer.render(
-            scene, flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.RGBA)
+            scene, flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.RGBA
+        )
+        renderer.delete()
+
         colormap = colormap.copy()
         colormap[depthmap == 0] = [0, 0, 0, 255]
         colormap = colormap[:, :, :3].astype(np.uint8)
         return colormap, depthmap
-    except OpenGL.error.NullFunctionError as e:
-        print(f"OpenGL error: {e}. Returning placeholder image.")
-        width, height = 640, 480
-        colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
-        depthmap = np.zeros((height, width), dtype=np.float32)
-        return colormap, depthmap
+
     except Exception as e:
         print(f"Rendering failed: {e}. Returning placeholder image.")
         width, height = 640, 480
-        colormap = np.full((height, width, 3), 128, dtype=np.uint8)  # Grey image
+        colormap = np.full((height, width, 3), 128, dtype=np.uint8)
         depthmap = np.zeros((height, width), dtype=np.float32)
         return colormap, depthmap
+
 
 AXES_CONV_TO_TUPLE = {
     'sxyz': (0, 0, 0, 0), 'sxyx': (0, 0, 1, 0), 'sxzy': (0, 1, 0, 0),
