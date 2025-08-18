@@ -1,0 +1,44 @@
+scene:
+  id: 2
+  name: Kiri_Vehera_SriLanka
+  dataset_path: .
+  voxel_size: 0.2
+  render_scale: 0.5
+  ground_plane:
+    enabled: true
+    size: 100
+    z: 0
+  axes:
+    enabled: true
+    length: 10
+
+ui:
+  window_title: UAV Flight Planning
+  window_geometry: [100, 100, 1200, 800]
+  use_plotly_webview: true
+  camera_slider_ranges:
+    X: [-100, 100, 0]
+    Y: [-100, 100, 0]
+    Z: [-100, 100, 10]
+    Yaw: [-180, 180, 0]
+    Pitch: [-90, 90, -20]
+
+defaults:
+  load_mesh: false
+  load_trajectory: false
+  default_cameras:
+    - origin: [0.0, -10.0, 3.0]
+      yaw: 90.0
+      pitch: -20
+    - origin: [3.8, -1.24, 2.0]
+      yaw: 162.0
+      pitch: -20
+    - origin: [5.88, 8.09, 3.0]
+      yaw: -126.0
+      pitch: -20
+    - origin: [-2.35, 3.24, 2.0]
+      yaw: -54.0
+      pitch: -20
+    - origin: [-9.51, -3.09, 3.0]
+      yaw: 18.0
+      pitch: -20]
