@@ -1,757 +1,933 @@
-from __future__ import annotations
-import json
+#!/usr/bin/env python3
+"""
+Production UAV Visualizer - Fixed Architecture
+Addresses renderer recreation issues, Open3D API mismatches, and Trimesh conversion.
+Includes dynamic view fitting, improved FPV setup, lighting, and mouse controls.
+Adds oriented waypoint markers (arrows) and directional arrows along trajectory.
+Implements debounced resize and background loading.
+"""
+
 import sys
+import os
+import time
+import json
+import queue
+import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional, Any
+from enum import Enum
+import logging
+import math
 
 import numpy as np
-import yaml
+import trimesh
+from scipy.interpolate import CubicSpline, interp1d
+import cv2
 
-# Third-party visualization/rendering
-import plotly.graph_objects as go
-import plotly.io as pio
+# GUI
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# Open3D
 import open3d as o3d
-import pyrender
 
-# Qt
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QCoreApplication, QSettings
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QSlider, QLabel, QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox
-)
+# Pillow for converting numpy images to Tkinter PhotoImage
+from PIL import Image, ImageTk
 
-# Plotly in Qt via WebEngine
-try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
-    HAS_WEBENGINE = True
-except Exception:
-    HAS_WEBENGINE = False
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for canvas rendering
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-
-from helpers import (
-    init, initialize_logging, load_camera_parameters, generate_camera_3d_thickness,
-    render_scene, create_route_trace, init_renderer, shared
-)
-
-
-# -----------------------------
-# Config management
-# -----------------------------
-DEFAULT_CONFIG = {
-    'scene': {
-        'id': 2,
-        'name': 'Kiri_Vehera_SriLanka',
-        'dataset_path': '.',
-        'voxel_size': 0.2,
-        'render_scale': 0.5,
-        'ground_plane': {'enabled': True, 'size': 100, 'z': 0},
-        'axes': {'enabled': True, 'length': 10},
-    },
-    'ui': {
-        'window_title': 'UAV Flight Planning',
-        'window_geometry': [100, 100, 1200, 800],
-        'use_plotly_webview': True,
-        'camera_slider_ranges': {
-            'X': [-100, 100, 0],
-            'Y': [-100, 100, 0],
-            'Z': [-100, 100, 10],
-            'Yaw': [-180, 180, 0],
-            'Pitch': [-90, 90, -20],
-        },
-    },
-    'defaults': {
-        'load_mesh': False,
-        'load_trajectory': False,
-        'default_cameras': [
-            {'origin': [0.0, -10.0, 3.0], 'yaw': 90.0, 'pitch': -20},
-            {'origin': [3.8, -1.24, 2.0], 'yaw': 162.0, 'pitch': -20},
-            {'origin': [5.88, 8.09, 3.0], 'yaw': -126.0, 'pitch': -20},
-            {'origin': [-2.35, 3.24, 2.0], 'yaw': -54.0, 'pitch': -20},
-            {'origin': [-9.51, -3.09, 3.0], 'yaw': 18.0, 'pitch': -20},
-        ],
-    },
-}
-
-
-def load_app_config(config_path: str = "config.yml") -> dict:
-    cfg_file = Path(config_path)
-    if not cfg_file.exists():
-        cfg_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cfg_file, 'w') as f:
-            yaml.safe_dump(DEFAULT_CONFIG, f)
-        return DEFAULT_CONFIG
-    with open(cfg_file, 'r') as f:
-        cfg = yaml.safe_load(f) or {}
-    # Merge shallowly with defaults to avoid missing keys
-    def merge(d, default):
-        out = dict(default)
-        for k, v in (d or {}).items():
-            if isinstance(v, dict) and isinstance(default.get(k), dict):
-                out[k] = merge(v, default[k])
-            else:
-                out[k] = v
-        return out
-    return merge(cfg, DEFAULT_CONFIG)
-
-
-# -----------------------------
-# Thread workers
-# -----------------------------
-class RenderThread(QThread):
-    render_finished = pyqtSignal(np.ndarray)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, origin: np.ndarray, yaw: float, pitch: float):
-        super().__init__()
-        self.origin = origin
-        self.yaw = float(yaw)
-        self.pitch = float(pitch)
-
-    def run(self):
-        try:
-            colormap, _ = render_scene(self.origin, self.yaw, self.pitch)
-            self.render_finished.emit(colormap)
-        except Exception as e:
-            self.error_signal.emit(f"Render error: {e}")
-
-
-# -----------------------------
-# Core visualization pieces
-# -----------------------------
-class CameraController:
-    def __init__(self, start_pos=(0.0, 0.0, 10.0), yaw=0.0, pitch=-20.0):
-        self.position = np.array(start_pos, dtype=float)
-        self.yaw = float(yaw)
-        self.pitch = float(pitch)
-
-    def update_position(self, dx: float, dy: float, dz: float):
-        self.position += np.array([dx, dy, dz], dtype=float)
-
-    def set_position(self, x: float, y: float, z: float):
-        self.position[:] = [x, y, z]
-
-    def update_rotation(self, dyaw: float, dpitch: float):
-        self.yaw = (self.yaw + dyaw) % 360
-        self.pitch = float(np.clip(self.pitch + dpitch, -90, 90))
-
-    def set_rotation(self, yaw: float, pitch: float):
-        self.yaw = float(yaw) % 360
-        self.pitch = float(np.clip(pitch, -90, 90))
-
-    def get_plotly_camera(self):
-        return dict(eye=dict(x=self.position[0], y=self.position[1], z=self.position[2]), up=dict(x=0, y=0, z=1))
-
-
-class PlotlyRenderer:
-    def __init__(self):
-        self.fig = go.Figure()
-        self.camera_controller = CameraController()
-
-    def reset(self):
-        self.fig = go.Figure()
-
-    from typing import Any
-    def add_objects(self, plotly_objs: List[Any]):
-        self.fig.data = []
-        for obj in plotly_objs:
-            if obj is not None:
-                self.fig.add_trace(obj)
-
-    def update_layout(self, title: Optional[str] = None):
-        layout_kwargs = dict(
-            scene=dict(
-                xaxis_title="X (m)", yaxis_title="Y (m)", zaxis_title="Z (m)",
-                camera=self.camera_controller.get_plotly_camera()
-            ),
-            showlegend=True
-        )
-        if title:
-            layout_kwargs['title'] = title
-        self.fig.update_layout(**layout_kwargs)
-
-    def get_html(self) -> str:
-        return pio.to_html(self.fig, full_html=False, include_plotlyjs='cdn')
-
-    # Fallback extraction for Matplotlib view 
-    def get_mesh_data(self) -> Optional[dict]:
-        for tr in self.fig.data:
-            if isinstance(tr, go.Mesh3d):
-                verts = np.column_stack([tr.x, tr.y, tr.z]).astype(float)
-                faces = np.column_stack([tr.i, tr.j, tr.k]).astype(int)
-                return {'vertices': verts, 'faces': faces}
-        return None
-
-    def get_route_data(self) -> Optional[dict]:
-        for tr in self.fig.data:
-            if isinstance(tr, go.Scatter3d) and tr.mode and 'lines' in tr.mode:
-                return {'x': np.array(tr.x, float), 'y': np.array(tr.y, float), 'z': np.array(tr.z, float)}
-        return None
-
-
-class SceneManager:
-    def __init__(self, config: dict):
-        self.config = config
-        self.mesh: Optional[o3d.geometry.TriangleMesh] = None
-        self.plotly_objs: List[go.BaseTraceType] = []
-        try:
-            initialize_logging("config.yml", is_for_photo=False)
-            init("config.yml", is_for_photo=False)
-        except Exception:
-            pass  # safe fallback if helpers handle their own init
-
-    def load_mesh(self, mesh_path: str):
-        # pull mesh from a preloaded pyrender scene if available
-        try:
-            init_renderer(scale=self.config['scene'].get('render_scale', 0.5), load_mesh=False)
-            if 'scene' in shared and shared['scene']:
-                for node in shared['scene'].nodes:
-                    if isinstance(node, pyrender.Node) and node.mesh:
-                        vertices = node.mesh.primitives[0].positions
-                        faces = node.mesh.primitives[0].indices
-                        self.mesh = o3d.geometry.TriangleMesh()
-                        self.mesh.vertices = o3d.utility.Vector3dVector(vertices)
-                        self.mesh.triangles = o3d.utility.Vector3iVector(faces)
-                        break
-        except Exception:
-            pass
-
-        if self.mesh is None:
-            mp = Path(mesh_path)
-            if not mp.exists():
-                raise FileNotFoundError(f"Mesh file not found: {mp}")
-            if mp.suffix.lower() not in ['.ply', '.obj', '.stl', '.glb', '.gltf']:
-                raise ValueError("Unsupported mesh format. Use .ply, .obj, .stl, .glb, or .gltf")
-            self.mesh = o3d.io.read_triangle_mesh(str(mp))
-            if not self.mesh.has_vertices():
-                raise ValueError(f"Mesh is empty: {mp}")
-
-        # Simplify
-        vx = float(self.config['scene'].get('voxel_size', 0.2))
-        if vx and vx > 0:
-            try:
-                self.mesh = self.mesh.simplify_vertex_clustering(
-                    voxel_size=vx,
-                    contraction=o3d.geometry.SimplificationContraction.Average
-                )
-            except Exception:
-                pass
-
-    def add_ground_plane(self):
-        gp_cfg = self.config['scene'].get('ground_plane', {})
-        if not gp_cfg.get('enabled', True):
-            return
-        size = float(gp_cfg.get('size', 100))
-        z = float(gp_cfg.get('z', 0))
-        x = np.linspace(-size, size, 10)
-        y = np.linspace(-size, size, 10)
-        xg, yg = np.meshgrid(x, y)
-        zg = np.full_like(xg, z, dtype=float)
-        ground_trace = go.Surface(x=xg, y=yg, z=zg, colorscale='Greys', opacity=0.5, showscale=False, name='Ground')
-        self.plotly_objs.append(ground_trace)
-
-    def add_coordinate_axes(self):
-        ax_cfg = self.config['scene'].get('axes', {})
-        if not ax_cfg.get('enabled', True):
-            return
-        length = float(ax_cfg.get('length', 10))
-        axes = [
-            go.Scatter3d(x=[0, length], y=[0, 0], z=[0, 0], mode='lines',
-                         line=dict(color='red', width=4), name='X'),
-            go.Scatter3d(x=[0, 0], y=[0, length], z=[0, 0], mode='lines',
-                         line=dict(color='green', width=4), name='Y'),
-            go.Scatter3d(x=[0, 0], y=[0, 0], z=[0, length], mode='lines',
-                         line=dict(color='blue', width=4), name='Z'),
-        ]
-        self.plotly_objs.extend(axes)
-
-    def get_scene_objects(self) -> List[go.BaseTraceType]:
-        objs = list(self.plotly_objs)
-        if self.mesh and self.mesh.has_vertices():
-            vertices = np.asarray(self.mesh.vertices)
-            triangles = np.asarray(self.mesh.triangles)
-            if self.mesh.has_vertex_colors():
-                vcols = (np.asarray(self.mesh.vertex_colors) * 255).astype(np.uint8)
-                colors = [f'rgb({c[0]},{c[1]},{c[2]})' for c in vcols]
-                mesh_trace = go.Mesh3d(
-                    x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
-                    i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2],
-                    vertexcolor=colors, opacity=1.0, name='Mesh'
-                )
-            else:
-                mesh_trace = go.Mesh3d(
-                    x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
-                    i=triangles[:, 0], j=triangles[:, 1], k=triangles[:, 2],
-                    color='lightblue', opacity=1.0, name='Mesh'
-                )
-            objs = [mesh_trace] + objs
-        return objs
-
-
-class WaypointParser:
-    def __init__(self):
-        self.waypoints: List[dict] = []
-        self.order: List[int] = []
-        self.metadata: dict = {}
-
-    def parse_json(self, json_path: str):
-        json_path = Path(json_path)
-        if not json_path.exists():
-            raise FileNotFoundError(f"Waypoint JSON not found: {json_path}")
-
+# -------------------------------
+# Event System
+# -------------------------------
+class EventBus:
+    """Thread-safe event bus for decoupled communication"""
     
-        try:
-            params = load_camera_parameters(str(json_path))
-        except Exception:
-            with open(json_path, 'r') as f:
-                params = json.load(f)
-
-        self.metadata = {
-            'num_cameras': params.get('num_cameras', len(params.get('positions', []))),
-            'scene_name': params.get('scene_name', ''),
-            'has_route': params.get('has_route', True)
-        }
-        positions = params.get('positions')
-        if positions is None:
-            positions = [wp.get('position') for wp in params.get('cameras', [])]
-
-        rotations = params.get('rotations')
-        if rotations is None:
-            rotations = [wp.get('rotation') for wp in params.get('cameras', [])]
-        self.waypoints = [
-            {'position': np.array(pos, dtype=float), 'rotation': np.array(rot, dtype=float)}
-            for pos, rot in zip(positions, rotations)
-        ]
-        self.order = params.get('waypoint_order', list(range(len(self.waypoints))))
-
-
-class PathVisualizer:
     def __init__(self):
-        self.plotly_objs: List[go.BaseTraceType] = []
-
-    def visualize_trajectory(self, waypoints: List[dict], order: List[int], name: str = "Path"):
-        params = {
-            'positions': np.array([wp['position'] for wp in waypoints]),
-            'rotations': np.array([wp['rotation'] for wp in waypoints]),
-            'waypoint_order': order,
-            'path_color_scale': 'Plotly3',
-            'name': name
-        }
-        try:
-            path_trace = create_route_trace(params)
-        except Exception:
-            
-            pts = params['positions'][order]
-            path_trace = go.Scatter3d(
-                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
-                mode='lines+markers',
-                line=dict(color='royalblue', width=6),
-                marker=dict(size=4, color='royalblue'),
-                name=name
-            )
-        camera_traces = []
-        for i, wp in enumerate(waypoints):
+        self._subscribers: Dict[str, List[Callable]] = {}
+        self._lock = threading.RLock()
+    
+    def subscribe(self, event_type: str, callback: Callable):
+        with self._lock:
+            if event_type not in self._subscribers:
+                self._subscribers[event_type] = []
+            self._subscribers[event_type].append(callback)
+    
+    def unsubscribe(self, event_type: str, callback: Callable):
+        with self._lock:
+            if event_type in self._subscribers:
+                try:
+                    self._subscribers[event_type].remove(callback)
+                except ValueError:
+                    pass
+    
+    def publish(self, event_type: str, data: Any = None):
+        with self._lock:
+            callbacks = self._subscribers.get(event_type, []).copy()
+        
+        for callback in callbacks:
             try:
-                cam_objs = generate_camera_3d_thickness(
-                    wp['position'], wp['rotation'][0], wp['rotation'][1], text=f"WP{i+1}", scale=0.5
-                )
-                camera_traces.extend(cam_objs)
-            except Exception:
-                
-                p = wp['position']
-                l = 0.3
-                camera_traces.extend([
-                    go.Scatter3d(x=[p[0], p[0]+l], y=[p[1], p[1]], z=[p[2], p[2]], mode='lines',
-                                 line=dict(color='red', width=3), showlegend=False),
-                    go.Scatter3d(x=[p[0], p[0]], y=[p[1], p[1]+l], z=[p[2], p[2]], mode='lines',
-                                 line=dict(color='green', width=3), showlegend=False),
-                    go.Scatter3d(x=[p[0], p[0]], y=[p[1], p[1]], z=[p[2], p[2]+l], mode='lines',
-                                 line=dict(color='blue', width=3), showlegend=False),
-                ])
-        self.plotly_objs.extend([path_trace] + camera_traces)
+                callback(data)
+            except Exception as e:
+                logger.error(f"Event callback error for {event_type}: {e}")
 
-    def visualize_default_cameras(self, camera_params: List[dict], name: str = "Default Path"):
-        positions = np.array([np.array(p['origin'], float) for p in camera_params])
-        n = len(positions)
-        cidx = np.linspace(0, 1, n)
-        path_trace = go.Scatter3d(
-            x=positions[:, 0], y=positions[:, 1], z=positions[:, 2],
-            mode='lines+markers', line=dict(color=cidx, colorscale='Plotly3', width=6),
-            marker=dict(size=5, color=cidx, colorscale='Plotly3', line=dict(width=1, color='white')),
-            customdata=np.arange(n), name=name
-        )
-        camera_traces = []
-        for i, params in enumerate(camera_params):
-            try:
-                objs = generate_camera_3d_thickness(params['origin'], params['yaw'], params['pitch'],
-                                                    text=f"Camera {i+1}", scale=0.5)
-            except Exception:
-                p = np.array(params['origin'], float)
-                l = 0.3
-                objs = [
-                    go.Scatter3d(x=[p[0], p[0]+l], y=[p[1], p[1]], z=[p[2], p[2]], mode='lines',
-                                 line=dict(color='red', width=3), showlegend=False),
-                    go.Scatter3d(x=[p[0], p[0]], y=[p[1], p[1]+l], z=[p[2], p[2]], mode='lines',
-                                 line=dict(color='green', width=3), showlegend=False),
-                    go.Scatter3d(x=[p[0], p[0]], y=[p[1], p[1]], z=[p[2], p[2]+l], mode='lines',
-                                 line=dict(color='blue', width=3), showlegend=False),
-                ]
-            camera_traces.extend(objs)
-        self.plotly_objs.extend([path_trace] + camera_traces)
+# Global event bus
+event_bus = EventBus()
 
-    def get_plotly_objects(self) -> List[go.BaseTraceType]:
-        return [obj for obj in self.plotly_objs if obj is not None]
+# -------------------------------
+# Data Models
+# -------------------------------
+class InterpolationMethod(Enum):
+    LINEAR = "linear"
+    SPLINE = "spline"
 
+@dataclass
+class Waypoint:
+    position: np.ndarray
+    yaw: float
+    pitch: float
+    index: int
 
-class DataExporter:
-    @staticmethod
-    def _to_serializable(obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, dict):
-            return {k: DataExporter._to_serializable(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [DataExporter._to_serializable(x) for x in obj]
-        if isinstance(obj, (np.floating, np.integer)):
-            return obj.item()
-        return obj
-
-    def export_mission(self, waypoints: List[dict], order: List[int], output_path: str):
-        mission = {
-            'metadata': {'total_cameras': len(waypoints)},
-            'cameras': [
-                {'position': self._to_serializable(wp['position']),
-                 'rotation': self._to_serializable(wp['rotation'])}
-                for wp in waypoints
-            ],
-            'waypoint_order': self._to_serializable(order)
+    def to_dict(self) -> Dict:
+        return {
+            'position': self.position.tolist(),
+            'yaw': self.yaw,
+            'pitch': self.pitch,
+            'index': self.index
         }
-        with open(output_path, 'w') as f:
-            json.dump(mission, f, indent=2)
 
+    @classmethod
+    def from_dict(cls, data: Dict, index: int) -> 'Waypoint':
+        if isinstance(data, (list, tuple)) and len(data) >= 3:
+            pos = np.array(data[:3], dtype=float)
+            return cls(position=pos, yaw=0.0, pitch=0.0, index=index)
+        
+        if 'position' in data and isinstance(data['position'], (list, tuple)):
+            pos = np.array(data['position'][:3], dtype=float)
+            return cls(position=pos, yaw=data.get('yaw', 0.0), pitch=data.get('pitch', 0.0), index=index)
+        
+        x = data.get('x') or data.get('lon') or data.get('longitude')
+        y = data.get('y') or data.get('lat') or data.get('latitude')
+        z = data.get('z') or data.get('alt') or data.get('altitude')
+        
+        if x is not None and y is not None and z is not None:
+            pos = np.array([float(x), float(y), float(z)], dtype=float)
+            return cls(position=pos, yaw=data.get('yaw', 0.0), pitch=data.get('pitch', 0.0), index=index)
+        
+        raise ValueError("Unrecognized waypoint format")
 
-class VisualizationSystem:
-    def __init__(self, config: dict):
-        self.config = config
-        self.scene_manager = SceneManager(config)
-        self.renderer = PlotlyRenderer()
-        self.exporter = DataExporter()
-        self.waypoints: List[dict] = []
-        self.order: List[int] = []
-        self.trajectory_manager: Optional[Tuple[WaypointParser, PathVisualizer]] = None
-        self.render_thread: Optional[RenderThread] = None
+@dataclass
+class Trajectory:
+    name: str
+    waypoints: List[Waypoint]
+    color: Tuple[float, float, float]
+    interpolation_method: InterpolationMethod = InterpolationMethod.SPLINE
+    _cached_positions: Optional[np.ndarray] = field(default=None, init=False)
+    _cached_interpolated: Optional[np.ndarray] = field(default=None, init=False)
+    _cache_dirty: bool = field(default=True, init=False)
 
-    # API 
-    def load_scene(self, mesh_path: str):
-        self.scene_manager.load_mesh(mesh_path)
-        self.scene_manager.plotly_objs.clear()
-        self.scene_manager.add_ground_plane()
-        self.scene_manager.add_coordinate_axes()
-        self.render()
+    def get_positions(self) -> np.ndarray:
+        """Get waypoint positions with caching"""
+        if self._cache_dirty or self._cached_positions is None:
+            self._cached_positions = np.array([wp.position for wp in self.waypoints])
+            self._cache_dirty = False
+        return self._cached_positions
 
-    def load_trajectory(self, json_path: str):
-        parser = WaypointParser()
-        parser.parse_json(json_path)
-        self.waypoints = parser.waypoints
-        self.order = parser.order
-        visualizer = PathVisualizer()
-        visualizer.visualize_trajectory(parser.waypoints, parser.order)
-        self.trajectory_manager = (parser, visualizer)
-        self.render()
+    def invalidate_cache(self):
+        """Mark cache as dirty"""
+        self._cache_dirty = True
+        self._cached_interpolated = None
 
-    def load_default_cameras(self, camera_params: List[dict]):
-        visualizer = PathVisualizer()
-        visualizer.visualize_default_cameras(camera_params)
-        self.trajectory_manager = (None, visualizer)
-        self.render()
+    def get_interpolated_path(self, num_points: int = 200) -> np.ndarray:
+        """Get interpolated path with caching"""
+        if self._cached_interpolated is None or self._cache_dirty:
+            if self.interpolation_method == InterpolationMethod.LINEAR:
+                self._cached_interpolated = TrajectoryInterpolator.interpolate_linear(self.waypoints, num_points)
+            else:
+                self._cached_interpolated = TrajectoryInterpolator.interpolate_spline(self.waypoints, num_points)
+        return self._cached_interpolated
 
-    def compare_trajectories(self, json_paths: List[str]):
-        # Accumulate multiple path visualizations
-        for i, json_path in enumerate(json_paths):
-            parser = WaypointParser()
-            parser.parse_json(json_path)
-            visualizer = PathVisualizer()
-            visualizer.visualize_trajectory(parser.waypoints, parser.order, name=f"Path {i+1}")
-            # Add to renderer without clearing
-            current = list(self.renderer.fig.data)
-            self.renderer.add_objects(list(current) + visualizer.get_plotly_objects())
-        self.renderer.update_layout(title="Trajectory Comparison")
+    def calculate_metrics(self, cruising_speed: float = 5.0, hover_time: float = 2.5) -> Dict:
+        positions = self.get_positions()
+        if len(positions) < 2:
+            return {
+                'total_length': 0.0,
+                'total_vertical': 0.0,
+                'total_duration': 0.0,
+                'sharp_corners': 0,
+                'num_waypoints': len(self.waypoints)
+            }
 
-    def render(self):
-        scene_objects = self.scene_manager.get_scene_objects()
-        trajectory_objects = self.trajectory_manager[1].get_plotly_objects() if self.trajectory_manager else []
-        self.renderer.add_objects(scene_objects + trajectory_objects)
-        self.renderer.update_layout(title=self.config['ui'].get('window_title', 'UAV Flight Planning'))
+        distances = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+        total_length = np.sum(distances)
+        
+        vertical_changes = np.abs(np.diff(positions[:, 2])) if positions.shape[1] > 2 else np.array([0.0])
+        total_vertical = np.sum(vertical_changes)
+        
+        flight_time = total_length / cruising_speed
+        total_hover = hover_time * len(self.waypoints)
+        total_duration = flight_time + total_hover
 
-    def render_waypoint_view(self, waypoint_index: int, callback):
-        if not self.trajectory_manager or not self.trajectory_manager[0]:
-            # if No JSON trajectory loaded -> placeholder FPV
-            width, height = 640, 480
-            colormap = np.full((height, width, 3), 128, dtype=np.uint8)
-            callback(colormap)
-            return None
-
-        parser, _ = self.trajectory_manager
-        if waypoint_index < 0 or waypoint_index >= len(parser.waypoints):
-            width, height = 640, 480
-            colormap = np.full((height, width, 3), 128, dtype=np.uint8)
-            callback(colormap)
-            return None
-
-        wp = parser.waypoints[waypoint_index]
-        self.render_thread = RenderThread(wp['position'], wp['rotation'][0], wp['rotation'][1])
-        self.render_thread.render_finished.connect(callback)
-        self.render_thread.error_signal.connect(lambda msg: callback(np.full((480, 640, 3), 128, dtype=np.uint8)))
-        self.render_thread.finished.connect(self.render_thread.deleteLater)
-        self.render_thread.start()
-        return self.render_thread
-
-    def export_mission(self, output_path: str):
-        if self.trajectory_manager and self.trajectory_manager[0]:
-            parser, _ = self.trajectory_manager
-            self.exporter.export_mission(parser.waypoints, parser.order, output_path)
-
-
-# -----------------------------
-# Qt application
-# -----------------------------
-class ViewerApp(QMainWindow):
-    def __init__(self, vis_system: VisualizationSystem, config: dict):
-        super().__init__()
-        self.vis_system = vis_system
-        self.config = config
-        self.settings = QSettings("YourOrg", "UAVViewer")
-        self._web_view: Optional[QWebEngineView] = None
-        self._mpl_canvas: Optional[FigureCanvas] = None
-        self._mpl_ax = None
-
-        self._init_ui()
-        self._load_initial_data()
-
-    # UI construction
-    def _init_ui(self):
-        title = self.config['ui'].get('window_title', 'UAV Flight Planning')
-        x, y, w, h = self.config['ui'].get('window_geometry', [100, 100, 1200, 800])
-        self.setWindowTitle(title)
-        self.setGeometry(x, y, w, h)
-
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout()
-        main_widget.setLayout(main_layout)
-
-        # Left pane: 3D view + controls
-        left_widget = QWidget()
-        left_layout = QVBoxLayout()
-        left_widget.setLayout(left_layout)
-        main_layout.addWidget(left_widget, stretch=2)
-
-        # 3D view
-        use_webview = self.config['ui'].get('use_plotly_webview', True) and HAS_WEBENGINE
-        if use_webview:
-            self._web_view = QWebEngineView()
-            left_layout.addWidget(self._web_view)
-        else:
-            self._mpl_canvas = FigureCanvas(plt.Figure(figsize=(6, 4)))
-            left_layout.addWidget(self._mpl_canvas)
-            self._mpl_ax = self._mpl_canvas.figure.add_subplot(111, projection='3d')
-            self._mpl_ax.set_xlabel('X')
-            self._mpl_ax.set_ylabel('Y')
-            self._mpl_ax.set_zlabel('Z')
-
-        # Controls
-        control_widget = QWidget()
-        control_layout = QVBoxLayout()
-        control_widget.setLayout(control_layout)
-        left_layout.addWidget(control_widget)
-
-        control_layout.addWidget(QLabel("Camera Controls"))
-        #  sliders from config
-        sliders_cfg = self.config['ui'].get('camera_slider_ranges', {})
-        self._sliders = {}
-        for name, values in sliders_cfg.items():
-            min_val, max_val, default = values
-            if name not in ['X', 'Y', 'Z', 'Yaw', 'Pitch']:
+        sharp_corners = 0
+        for i in range(1, len(positions) - 1):
+            v1 = positions[i] - positions[i - 1]
+            v2 = positions[i + 1] - positions[i]
+            norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if norm1 == 0 or norm2 == 0:
                 continue
-            slider = self._add_slider(control_layout, name, min_val, max_val, default,
-                                      getattr(self, f"_update_camera_{name.lower()}"))
-            self._sliders[name] = slider
+            angle = np.arccos(np.clip(np.dot(v1, v2) / (norm1 * norm2), -1, 1))
+            if np.degrees(angle) > 90:
+                sharp_corners += 1
 
-        control_layout.addWidget(QLabel("Scene and Trajectory"))
-        self.load_mesh_btn = QPushButton("Load Mesh")
-        self.load_mesh_btn.clicked.connect(self._load_mesh_dialog)
-        control_layout.addWidget(self.load_mesh_btn)
+        return {
+            'total_length': total_length,
+            'total_vertical': total_vertical,
+            'total_duration': total_duration,
+            'sharp_corners': sharp_corners,
+            'num_waypoints': len(self.waypoints)
+        }
 
-        self.load_traj_btn = QPushButton("Load Trajectory")
-        self.load_traj_btn.clicked.connect(self._load_trajectory_dialog)
-        control_layout.addWidget(self.load_traj_btn)
+# -------------------------------
+# Interpolation Utilities
+# -------------------------------
+class TrajectoryInterpolator:
+    @staticmethod
+    def interpolate_linear(waypoints: List[Waypoint], num_points: int) -> np.ndarray:
+        positions = np.array([wp.position for wp in waypoints])
+        if len(positions) < 2:
+            return positions
+        t = np.linspace(0, 1, len(positions))
+        interpolator = interp1d(t, positions, axis=0)
+        t_new = np.linspace(0, 1, num_points)
+        return interpolator(t_new)
 
-        # Right pane: table + FPV + export
-        right_widget = QWidget()
-        right_layout = QVBoxLayout()
-        right_widget.setLayout(right_layout)
-        main_layout.addWidget(right_widget, stretch=1)
+    @staticmethod
+    def interpolate_spline(waypoints: List[Waypoint], num_points: int) -> np.ndarray:
+        positions = np.array([wp.position for wp in waypoints])
+        if len(positions) < 3:
+            return TrajectoryInterpolator.interpolate_linear(waypoints, num_points)
+        t = np.arange(len(positions))
+        cs = CubicSpline(t, positions, axis=0, bc_type='natural')
+        t_new = np.linspace(0, len(positions) - 1, num_points)
+        return cs(t_new)
 
-        self.waypoint_table = QTableWidget()
-        self.waypoint_table.setColumnCount(5)
-        self.waypoint_table.setHorizontalHeaderLabels(["Index", "X", "Y", "Z", "Yaw"])
-        self.waypoint_table.cellClicked.connect(self._waypoint_selected)
-        right_layout.addWidget(self.waypoint_table)
+# -------------------------------
+# Geometry Cache and Management
+# -------------------------------
+class GeometryCache:
+    """Cache for Open3D geometry objects"""
+    
+    def __init__(self):
+        self._cache: Dict[str, o3d.geometry.Geometry] = {}
+        self._dirty_flags: Dict[str, bool] = {}
+    
+    def get(self, key: str) -> Optional[o3d.geometry.Geometry]:
+        return self._cache.get(key)
+    
+    def set(self, key: str, geometry: o3d.geometry.Geometry):
+        self._cache[key] = geometry
+        self._dirty_flags[key] = False
+    
+    def mark_dirty(self, key: str):
+        self._dirty_flags[key] = True
+    
+    def is_dirty(self, key: str) -> bool:
+        return self._dirty_flags.get(key, True)
+    
+    def clear(self):
+        self._cache.clear()
+        self._dirty_flags.clear()
 
-        self.export_btn = QPushButton("Export Mission")
-        self.export_btn.clicked.connect(self._export_mission_dialog)
-        right_layout.addWidget(self.export_btn)
-
-        self.fpv_canvas = FigureCanvas(plt.Figure(figsize=(4, 3)))
-        right_layout.addWidget(self.fpv_canvas)
-        self.fpv_ax = self.fpv_canvas.figure.add_subplot(111)
-        self.fpv_ax.axis('off')
-
-    def _add_slider(self, layout, name, min_val, max_val, default, callback):
-        slider_layout = QHBoxLayout()
-        label = QLabel(f"{name}: {default}")
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(int(min_val), int(max_val))
-        slider.setValue(int(default))
-        slider.valueChanged.connect(lambda val: (callback(val), label.setText(f"{name}: {val}")))
-        slider_layout.addWidget(QLabel(name))
-        slider_layout.addWidget(slider)
-        slider_layout.addWidget(label)
-        layout.addLayout(slider_layout)
-        return slider
-
-    # Camera slider callbacks
-    def _update_camera_x(self, val):
-        cur = self.vis_system.renderer.camera_controller.position[0]
-        self.vis_system.renderer.camera_controller.set_position(val, self.vis_system.renderer.camera_controller.position[1], self.vis_system.renderer.camera_controller.position[2])
-        self._update_3d_view()
-
-    def _update_camera_y(self, val):
-        self.vis_system.renderer.camera_controller.set_position(self.vis_system.renderer.camera_controller.position[0], val, self.vis_system.renderer.camera_controller.position[2])
-        self._update_3d_view()
-
-    def _update_camera_z(self, val):
-        self.vis_system.renderer.camera_controller.set_position(self.vis_system.renderer.camera_controller.position[0], self.vis_system.renderer.camera_controller.position[1], val)
-        self._update_3d_view()
-
-    def _update_camera_yaw(self, val):
-        self.vis_system.renderer.camera_controller.set_rotation(val, self.vis_system.renderer.camera_controller.pitch)
-        self._update_3d_view()
-
-    def _update_camera_pitch(self, val):
-        self.vis_system.renderer.camera_controller.set_rotation(self.vis_system.renderer.camera_controller.yaw, val)
-        self._update_3d_view()
-
-    # Dialogs and actions
-    def _load_mesh_dialog(self):
-        last_dir = self.settings.value("last_dir_mesh", str(Path.home()))
-        mesh_path, _ = QFileDialog.getOpenFileName(self, "Load Mesh File", last_dir, "Mesh Files (*.ply *.obj *.stl *.glb *.gltf)")
-        if mesh_path:
+# -------------------------------
+# Persistent Renderer with Debounced Resize
+# -------------------------------
+class PersistentRenderer:
+    """Persistent Open3D renderer with debounced resize support"""
+    
+    def __init__(self, name: str, width: int = 960, height: int = 720):
+        self.name = name
+        self.width = width
+        self.height = height
+        self.vis: Optional[o3d.visualization.Visualizer] = None
+        self.geometry_cache = GeometryCache()
+        self._is_initialized = False
+        self._view_control = None
+        self._camera_params = {
+            'lookat': np.array([0.0, 0.0, 0.0]),
+            'front': np.array([0.0, 0.0, -1.0]),
+            'up': np.array([0.0, 1.0, 0.0]),
+            'zoom': 0.7
+        }
+        self._geometries: List[o3d.geometry.Geometry] = []  # Track geometries manually
+    
+    def initialize(self) -> bool:
+        """Initialize the renderer"""
+        if self._is_initialized:
+            return True
+            
+        try:
+            self.vis = o3d.visualization.Visualizer()
+            self.vis.create_window(
+                window_name=self.name,
+                width=self.width,
+                height=self.height,
+                visible=False
+            )
+            self._view_control = self.vis.get_view_control()
+            self._setup_render_options()
+            self._apply_camera_params()
+            self._is_initialized = True
+            logger.info(f"{self.name}: Renderer initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"{self.name}: Failed to initialize: {e}")
+            return False
+    
+    def _setup_render_options(self):
+        """Setup rendering options"""
+        if self.vis:
+            opt = self.vis.get_render_option()
+            opt.background_color = np.array([0.15, 0.15, 0.15])
+            opt.light_on = True
+            opt.point_size = 3.0
+            opt.line_width = 2.0
+    
+    def update_viewport(self, width: int, height: int):
+        """Update viewport size with recreation"""
+        if width < 1 or height < 1:
+            return
+        if self.width == width and self.height == height:
+            return
+            
+        logger.debug(f"{self.name}: Resizing to {width}x{height}")
+        self.cleanup()
+        self.width = width
+        self.height = height
+        self.initialize()
+        # Re-add geometries
+        self.update_geometries(self._geometries)
+        self._apply_camera_params()
+    
+    def update_geometries(self, geometries: List[o3d.geometry.Geometry]):
+        """Update geometries efficiently using cache"""
+        if not self._is_initialized or not self.vis:
+            return
+            
+        try:
+            self.vis.clear_geometries()
+            for geom in geometries:
+                if geom is not None:
+                    self.vis.add_geometry(geom, reset_bounding_box=False)
+            self._geometries = geometries.copy()  # Update tracked geometries
+            self.fit_view()
+            self.vis.update_renderer()
+        except Exception as e:
+            logger.error(f"{self.name}: Error updating geometries: {e}")
+    
+    def fit_view(self):
+        """Fit camera to scene bounding box"""
+        if not self.vis or not self._view_control or not self._geometries:
+            return
+            
+        try:
+            bbox = o3d.geometry.AxisAlignedBoundingBox()
+            for geom in self._geometries:
+                if geom is not None:
+                    geom_bbox = geom.get_axis_aligned_bounding_box()
+                    if not geom_bbox.is_empty():
+                        bbox = bbox.volume_union(geom_bbox)
+            
+            if not bbox.is_empty():
+                center = bbox.get_center()
+                extent = bbox.get_max_extent()
+                self._camera_params['lookat'] = center
+                self._camera_params['zoom'] = max(0.02, min(2.0, 0.02 + (extent / 1000.0)))  # Adjust zoom dynamically
+                self._camera_params['front'] = np.array([0.0, 0.0, -1.0])
+                self._camera_params['up'] = np.array([0.0, 1.0, 0.0])
+                self._apply_camera_params()
+                logger.debug(f"{self.name}: View fitted to bbox center {center}, extent {extent}")
+        except Exception as e:
+            logger.error(f"{self.name}: Error fitting view: {e}")
+    
+    def _apply_camera_params(self):
+        """Apply current camera parameters"""
+        if self._view_control:
+            vc = self._view_control
+            vc.set_lookat(self._camera_params['lookat'])
+            vc.set_front(self._camera_params['front'])
+            vc.set_up(self._camera_params['up'])
+            vc.set_zoom(self._camera_params['zoom'])
+    
+    def set_camera_params(self, params: Dict[str, Any]):
+        """Set camera parameters"""
+        self._camera_params.update(params)
+        self._apply_camera_params()
+    
+    def render_frame(self) -> Optional[np.ndarray]:
+        """Render current frame"""
+        if not self._is_initialized or not self.vis:
+            return None
+            
+        try:
+            self.vis.poll_events()
+            self.vis.update_renderer()
+            img = self.vis.capture_screen_float_buffer(do_render=True)
+            arr = (np.asarray(img) * 255).astype(np.uint8)
+            return arr
+        except Exception as e:
+            logger.error(f"{self.name}: Render error: {e}")
+            return None
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.vis:
             try:
-                self.vis_system.load_scene(mesh_path)
-                self.settings.setValue("last_dir_mesh", str(Path(mesh_path).parent))
-                self._update_waypoint_table()  #  shows waypoints when loaded
-                self._update_3d_view()
+                self.vis.destroy_window()
             except Exception as e:
-                QMessageBox.warning(self, "Load Mesh Error", str(e))
+                logger.error(f"{self.name}: Error destroying window: {e}")
+            self.vis = None
+        self._is_initialized = False
 
-    def _load_trajectory_dialog(self):
-        last_dir = self.settings.value("last_dir_traj", str(Path.home()))
-        json_path, _ = QFileDialog.getOpenFileName(self, "Load Trajectory JSON", last_dir, "JSON Files (*.json)")
-        if json_path:
-            try:
-                self.vis_system.load_trajectory(json_path)
-                self.settings.setValue("last_dir_traj", str(Path(json_path).parent))
-                self._update_waypoint_table()
-                self._update_3d_view()
-                if self.vis_system.waypoints:
-                    self._update_fpv(0)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()  # Prints full traceback to console
-                QMessageBox.warning(self, "Load Trajectory Error", str(e))
-                raise  # stops execution and shows traceback in console
-
-
-    def _export_mission_dialog(self):
-        last_dir = self.settings.value("last_dir_export", str(Path.cwd()))
-        output_path, _ = QFileDialog.getSaveFileName(self, "Export Mission", str(Path(last_dir) / "mission_output.json"), "JSON Files (*.json)")
-        if output_path:
-            try:
-                self.vis_system.export_mission(output_path)
-                self.settings.setValue("last_dir_export", str(Path(output_path).parent))
-            except Exception as e:
-                QMessageBox.warning(self, "Export Error", str(e))
-
-    # View updates
-    def _update_waypoint_table(self):
-        self.waypoint_table.setRowCount(len(self.vis_system.waypoints))
-        for i, wp in enumerate(self.vis_system.waypoints):
-            pos = wp['position']
-            yaw = float(wp['rotation'][0])
-            self.waypoint_table.setItem(i, 0, QTableWidgetItem(str(i)))
-            self.waypoint_table.setItem(i, 1, QTableWidgetItem(f"{pos[0]:.2f}"))
-            self.waypoint_table.setItem(i, 2, QTableWidgetItem(f"{pos[1]:.2f}"))
-            self.waypoint_table.setItem(i, 3, QTableWidgetItem(f"{pos[2]:.2f}"))
-            self.waypoint_table.setItem(i, 4, QTableWidgetItem(f"{yaw:.2f}"))
-
-    def _waypoint_selected(self, row, _):
-        self._update_fpv(row)
-
-    def _update_fpv(self, index: int):
-        def update_plot(colormap: np.ndarray):
-            self.fpv_ax.clear()
-            self.fpv_ax.imshow(colormap)
-            self.fpv_ax.axis('off')
-            title = "FPV Preview (Placeholder)" if np.all(colormap == 128) else "FPV Preview"
-            self.fpv_ax.set_title(title)
-            self.fpv_canvas.draw()
-        self.vis_system.render_waypoint_view(index, update_plot)
-
-    def _update_3d_view(self):
-        self.vis_system.render()
-        if self._web_view is not None:
-            html = self.vis_system.renderer.get_html()
-            self._web_view.setHtml(html)
-        else:
-            # Fallback static Matplotlib view
-            ax = self._mpl_ax
-            ax.clear()
-            mesh_data = self.vis_system.renderer.get_mesh_data()
-            if mesh_data:
-                ax.plot_trisurf(
-                    mesh_data['vertices'][:, 0], mesh_data['vertices'][:, 1], mesh_data['vertices'][:, 2],
-                    triangles=mesh_data['faces'], color='lightblue', linewidth=0.2, antialiased=True, alpha=0.9
+# -------------------------------
+# Scene Management
+# -------------------------------
+class SceneManager:
+    """Manages 3D scene elements"""
+    
+    def __init__(self):
+        self.model: Optional[o3d.geometry.TriangleMesh] = None
+        self.ground_plane: o3d.geometry.TriangleMesh = o3d.geometry.TriangleMesh.create_box(width=100.0, height=100.0, depth=0.01)
+        self.ground_plane.paint_uniform_color([0.3, 0.3, 0.3])
+        self.ground_plane.translate([-50, -50, -0.01])
+        self.show_ground = True
+        self.coordinate_axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=5.0)
+        event_bus.subscribe('trajectory_updated', self._on_trajectory_updated)
+        event_bus.subscribe('selection_updated', self._on_selection_updated)
+    
+    def _on_trajectory_updated(self, data):
+        event_bus.publish('scene_updated')
+    
+    def _on_selection_updated(self, data):
+        event_bus.publish('scene_updated')
+    
+    def load_model(self, filepath: str) -> bool:
+        """Load 3D model"""
+        try:
+            tm = trimesh.load(filepath)
+            self.model = trimesh.exchange.open3d.export_mesh(tm, include_texture=False)
+            self.model.compute_vertex_normals()
+            if not self.model.has_triangle_normals():
+                self.model.compute_triangle_normals()
+            if not self.model.has_vertex_colors():
+                self.model.paint_uniform_color([0.8, 0.8, 0.8])
+            logger.info(f"Open3D mesh loaded successfully from {filepath}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load model {filepath}: {e}")
+            return False
+    
+    def toggle_ground_plane(self) -> bool:
+        """Toggle ground plane"""
+        self.show_ground = not self.show_ground
+        return self.show_ground
+    
+    def get_geometries(self, trajectories: List[Trajectory], selected_trajectory: Optional[Trajectory], selected_waypoint: Optional[int]) -> List[o3d.geometry.Geometry]:
+        """Get all scene geometries"""
+        geometries = []
+        
+        if self.model:
+            geometries.append(self.model)
+        
+        if self.show_ground:
+            geometries.append(self.ground_plane)
+        
+        geometries.append(self.coordinate_axes)
+        
+        for traj in trajectories:
+            # Trajectory path
+            path = traj.get_interpolated_path()
+            if len(path) >= 2:
+                line_set = o3d.geometry.LineSet()
+                line_set.points = o3d.utility.Vector3dVector(path)
+                lines = [[i, i+1] for i in range(len(path)-1)]
+                line_set.lines = o3d.utility.Vector2iVector(lines)
+                line_set.paint_uniform_color(traj.color)
+                geometries.append(line_set)
+            
+            # Directional arrows along path
+            if len(path) > 10:
+                step = max(1, len(path) // 10)
+                for i in range(0, len(path)-1, step):
+                    pos = path[i]
+                    dir_vec = path[i+1] - path[i]
+                    if np.linalg.norm(dir_vec) > 1e-6:
+                        dir_vec /= np.linalg.norm(dir_vec)
+                        arrow = o3d.geometry.TriangleMesh.create_arrow(
+                            cylinder_radius=0.05, cone_radius=0.1, 
+                            cylinder_height=0.5, cone_height=0.2
+                        )
+                        arrow.paint_uniform_color(traj.color)
+                        # Rotate arrow to direction
+                        z_axis = np.array([0,0,1])
+                        rotation_axis = np.cross(z_axis, dir_vec)
+                        if np.linalg.norm(rotation_axis) > 1e-6:
+                            rotation_axis /= np.linalg.norm(rotation_axis)
+                            angle = np.arccos(np.dot(z_axis, dir_vec))
+                            rot_mat = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
+                            arrow.rotate(rot_mat, center=(0,0,0))
+                        arrow.translate(pos)
+                        geometries.append(arrow)
+            
+            # Waypoint markers with orientation
+            for wp in traj.waypoints:
+                color = [1,0,0] if selected_trajectory == traj and selected_waypoint == wp.index else traj.color
+                marker = o3d.geometry.TriangleMesh.create_arrow(
+                    cylinder_radius=0.1, cone_radius=0.2, 
+                    cylinder_height=1.0, cone_height=0.5
                 )
-            route = self.vis_system.renderer.get_route_data()
-            if route:
-                ax.plot(route['x'], route['y'], route['z'], 'r-', label='Route')
-                ax.legend(loc='upper right')
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_zlabel('Z')
-            self._mpl_canvas.draw()
+                marker.paint_uniform_color(color)
+                # Apply yaw and pitch rotation
+                yaw_rad = np.deg2rad(wp.yaw)
+                pitch_rad = np.deg2rad(wp.pitch)
+                rot_yaw = o3d.geometry.get_rotation_matrix_from_axis_angle([0,0,1] * yaw_rad)
+                rot_pitch = o3d.geometry.get_rotation_matrix_from_axis_angle([0,1,0] * pitch_rad)
+                rot = np.matmul(rot_pitch, rot_yaw)
+                marker.rotate(rot, center=(0,0,0))
+                marker.translate(wp.position)
+                geometries.append(marker)
+        
+        return geometries
 
-    def _load_initial_data(self):
-        #  load defaults from config 
-        defaults = self.config.get('defaults', {})
-        if defaults.get('default_cameras'):
-            self.vis_system.load_default_cameras(defaults['default_cameras'])
-        self._update_3d_view()
+# -------------------------------
+# UAV Visualization Application
+# -------------------------------
+class UAVVisualizationApp:
+    """Main UAV Visualization Application"""
+    
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("UAV Trajectory Visualizer")
+        self.root.geometry("1280x800")
+        self.root.minsize(800, 600)
+        
+        self.trajectories: List[Trajectory] = []
+        self.selected_trajectory: Optional[Trajectory] = None
+        self.selected_waypoint: Optional[int] = None
+        self.scene = SceneManager()
+        
+        self.main_renderer = PersistentRenderer("Main 3D View", 960, 720)
+        self.fpv_renderer = PersistentRenderer("FPV View", 400, 300)
+        
+        self._main_photo: Optional[ImageTk.PhotoImage] = None
+        self._fpv_photo: Optional[ImageTk.PhotoImage] = None
+        self._mouse_last: Optional[Tuple[int, int]] = None
+        self._is_dragging = False
+        self.resize_after_id: Optional[str] = None
+        
+        self.setup_ui()
+        self._render_loop()
+        
+        event_bus.subscribe('scene_updated', self._update_scene_rendering)
+        event_bus.subscribe('trajectory_updated', self._update_trajectory_ui)
+        
+        self.root.after(100, self._initialize_renderers)
+    
+    def setup_ui(self):
+        """Setup user interface"""
+        # Main frame
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Left: 3D canvas
+        self.main_canvas = tk.Canvas(main_frame, bg='black')
+        self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.main_canvas.bind("<Configure>", self._on_canvas_resize)
+        self.main_canvas.bind("<Button-1>", self._on_mouse_press)
+        self.main_canvas.bind("<B1-Motion>", self._on_mouse_drag)
+        self.main_canvas.bind("<ButtonRelease-1>", self._on_mouse_release)
+        self.main_canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        
+        # Right: Controls
+        control_pane = ttk.Notebook(main_frame, width=400)
+        control_pane.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Trajectory tab
+        traj_tab = ttk.Frame(control_pane)
+        control_pane.add(traj_tab, text="Trajectories")
+        
+        ttk.Button(traj_tab, text="Load Model", command=self.load_model).pack(pady=5, fill=tk.X)
+        ttk.Button(traj_tab, text="Load Trajectory", command=self.load_trajectory).pack(pady=5, fill=tk.X)
+        ttk.Button(traj_tab, text="Save Trajectory", command=self.save_trajectory).pack(pady=5, fill=tk.X)
+        ttk.Button(traj_tab, text="Toggle Ground", command=self.toggle_ground_plane).pack(pady=5, fill=tk.X)
+        ttk.Button(traj_tab, text="Compare Trajectories", command=self.compare_trajectories).pack(pady=5, fill=tk.X)
+        ttk.Button(traj_tab, text="Reset View", command=self._reset_main_view).pack(pady=5, fill=tk.X)
+        
+        self.interp_method = tk.StringVar(value="spline")
+        interp_frame = ttk.Frame(traj_tab)
+        interp_frame.pack(pady=5, fill=tk.X)
+        ttk.Radiobutton(interp_frame, text="Linear", variable=self.interp_method, value="linear", command=self._on_interpolation_changed).pack(side=tk.LEFT)
+        ttk.Radiobutton(interp_frame, text="Spline", variable=self.interp_method, value="spline", command=self._on_interpolation_changed).pack(side=tk.LEFT)
+        
+        self.waypoint_listbox = tk.Listbox(traj_tab, height=10)
+        self.waypoint_listbox.pack(pady=5, fill=tk.X)
+        self.waypoint_listbox.bind('<<ListboxSelect>>', self._on_waypoint_select)
+        
+        self.info_text = tk.Text(traj_tab, height=8, wrap=tk.WORD)
+        self.info_text.pack(pady=5, fill=tk.X)
+        
+        # FPV tab
+        fpv_tab = ttk.Frame(control_pane)
+        control_pane.add(fpv_tab, text="FPV Preview")
+        
+        self.fpv_label = tk.Label(fpv_tab, bg='black', text="Select waypoint for FPV")
+        self.fpv_label.pack(pady=10, fill=tk.BOTH, expand=True)
+    
+    def _initialize_renderers(self):
+        """Initialize renderers"""
+        if self.main_renderer.initialize() and self.fpv_renderer.initialize():
+            logger.info("Renderers initialized successfully")
+            event_bus.publish('scene_updated')
+        else:
+            messagebox.showerror("Error", "Failed to initialize renderers")
+    
+    def _render_loop(self):
+        """Main rendering loop (~30 FPS)"""
+        main_frame = self.main_renderer.render_frame()
+        if main_frame is not None:
+            self._display_main_frame(main_frame)
+        
+        fpv_frame = self.fpv_renderer.render_frame()
+        if fpv_frame is not None:
+            self._display_fpv_frame(fpv_frame)
+        
+        self.root.after(33, self._render_loop)
+    
+    def _update_scene_rendering(self, data=None):
+        """Update scene rendering"""
+        geometries = self.scene.get_geometries(self.trajectories, self.selected_trajectory, self.selected_waypoint)
+        self.main_renderer.update_geometries(geometries)
+        self.fpv_renderer.update_geometries(geometries)
+    
+    def _update_fpv_camera(self):
+        """Update FPV camera based on selected waypoint"""
+        if not self.selected_trajectory or self.selected_waypoint is None:
+            return
+            
+        wp = self.selected_trajectory.waypoints[self.selected_waypoint]
+        pos = wp.position
+        yaw_rad = np.deg2rad(wp.yaw)
+        pitch_rad = np.deg2rad(wp.pitch)
+        front = np.array([
+            math.cos(pitch_rad) * math.cos(yaw_rad),
+            math.cos(pitch_rad) * math.sin(yaw_rad),
+            math.sin(pitch_rad)
+        ])
+        up = np.array([0, 0, 1])  # Assuming Z up
+        params = {
+            'lookat': pos + front * 10.0,  # Larger offset
+            'front': -front,
+            'up': up,
+            'zoom': 0.1
+        }
+        self.fpv_renderer.set_camera_params(params)
+    
+    def _update_trajectory_ui(self, data=None):
+        """Update trajectory UI"""
+        self._update_info_display()
+        self._update_waypoint_list()
+    
+    def _display_main_frame(self, frame: np.ndarray):
+        """Display frame in main canvas"""
+        try:
+            img = Image.fromarray(frame)
+            canvas_width = self.main_canvas.winfo_width()
+            canvas_height = self.main_canvas.winfo_height()
+            if canvas_width > 1 and canvas_height > 1:
+                img = img.resize((canvas_width, canvas_height), Image.LANCZOS)
+                self._main_photo = ImageTk.PhotoImage(img)
+                self.main_canvas.delete("all")
+                self.main_canvas.create_image(0, 0, anchor=tk.NW, image=self._main_photo)
+        except Exception as e:
+            logger.error(f"Error displaying main frame: {e}")
+    
+    def _display_fpv_frame(self, frame: np.ndarray):
+        """Display frame in FPV view"""
+        try:
+            img = Image.fromarray(frame)
+            label_width = self.fpv_label.winfo_width()
+            label_height = self.fpv_label.winfo_height()
+            if label_width > 1 and label_height > 1:
+                img = img.resize((label_width, label_height), Image.LANCZOS)
+                self._fpv_photo = ImageTk.PhotoImage(img)
+                self.fpv_label.configure(image=self._fpv_photo, text="")
+        except Exception as e:
+            logger.error(f"Error displaying FPV frame: {e}")
+    
+    def _on_canvas_resize(self, event):
+        """Handle canvas resize with debounce"""
+        if self.resize_after_id:
+            self.root.after_cancel(self.resize_after_id)
+        self.resize_after_id = self.root.after(200, lambda: self.main_renderer.update_viewport(event.width, event.height))
+    
+    def _on_interpolation_changed(self):
+        """Handle interpolation method change"""
+        if not self.selected_trajectory:
+            return
+        method = InterpolationMethod.LINEAR if self.interp_method.get() == "linear" else InterpolationMethod.SPLINE
+        if self.selected_trajectory.interpolation_method != method:
+            self.selected_trajectory.interpolation_method = method
+            self.selected_trajectory.invalidate_cache()
+            event_bus.publish('trajectory_updated')
+    
+    def _on_waypoint_select(self, event):
+        """Handle waypoint selection"""
+        selection = event.widget.curselection()
+        if not selection or not self.selected_trajectory:
+            return
+        self.selected_waypoint = selection[0]
+        event_bus.publish('selection_updated')
+        self._update_fpv_camera()
+    
+    def _update_info_display(self):
+        """Update trajectory information display"""
+        self.info_text.delete(1.0, tk.END)
+        if not self.selected_trajectory:
+            self.info_text.insert(tk.END, "No trajectory selected\n")
+            return
+        try:
+            metrics = self.selected_trajectory.calculate_metrics()
+            self.info_text.insert(tk.END, f"TRAJECTORY: {self.selected_trajectory.name}\n")
+            self.info_text.insert(tk.END, "=" * 30 + "\n\n")
+            self.info_text.insert(tk.END, f"Waypoints: {metrics['num_waypoints']}\n")
+            self.info_text.insert(tk.END, f"Total length: {metrics['total_length']:.2f} m\n")
+            self.info_text.insert(tk.END, f"Total vertical: {metrics['total_vertical']:.2f} m\n")
+            self.info_text.insert(tk.END, f"Est. duration: {metrics['total_duration']:.1f} s\n")
+            self.info_text.insert(tk.END, f"Sharp corners: {metrics['sharp_corners']}\n")
+            self.info_text.insert(tk.END, f"Interpolation: {self.selected_trajectory.interpolation_method.value}\n")
+        except Exception as e:
+            logger.error(f"Error updating info display: {e}")
+            self.info_text.insert(tk.END, "Error calculating metrics\n")
+    
+    def _update_waypoint_list(self):
+        """Update waypoint list"""
+        self.waypoint_listbox.delete(0, tk.END)
+        if not self.selected_trajectory:
+            return
+        for i, wp in enumerate(self.selected_trajectory.waypoints):
+            pos_str = f"[{wp.position[0]:.1f}, {wp.position[1]:.1f}, {wp.position[2]:.1f}]"
+            angle_str = f"(yaw: {wp.yaw:.1f}°, pitch: {wp.pitch:.1f}°)"
+            self.waypoint_listbox.insert(tk.END, f"{i}: {pos_str} {angle_str}")
+    
+    def _on_mouse_press(self, event):
+        self._mouse_last = (event.x, event.y)
+        self._is_dragging = True
+    
+    def _on_mouse_drag(self, event):
+        if not self._is_dragging or self._mouse_last is None:
+            return
+        dx = event.x - self._mouse_last[0]
+        dy = event.y - self._mouse_last[1]
+        params = self.main_renderer._camera_params
+        yaw = math.atan2(params['front'][1], params['front'][0])
+        pitch = math.asin(params['front'][2])
+        yaw += np.deg2rad(dx * 0.2)
+        pitch -= np.deg2rad(dy * 0.2)
+        pitch = np.clip(pitch, -math.pi/2 + 1e-6, math.pi/2 - 1e-6)
+        front = np.array([
+            math.cos(pitch) * math.cos(yaw),
+            math.cos(pitch) * math.sin(yaw),
+            math.sin(pitch)
+        ])
+        params['front'] = front
+        self.main_renderer.set_camera_params(params)
+        self._mouse_last = (event.x, event.y)
+    
+    def _on_mouse_release(self, event):
+        self._is_dragging = False
+        self._mouse_last = None
+    
+    def _on_mouse_wheel(self, event):
+        delta = -event.delta / 120.0  # Positive forward
+        params = self.main_renderer._camera_params
+        params['zoom'] = np.clip(params['zoom'] + delta * 0.05, 0.01, 2.0)
+        self.main_renderer.set_camera_params(params)
+    
+    def _reset_main_view(self):
+        self.main_renderer.fit_view()
+    
+    def load_model(self):
+        """Load 3D model in background"""
+        filepath = filedialog.askopenfilename(
+            title="Select 3D Model",
+            filetypes=[("3D Models", "*.obj *.ply *.stl"), ("All files", "*.*")]
+        )
+        if not filepath:
+            return
+        
+        def load_task():
+            success = self.scene.load_model(filepath)
+            def update_ui():
+                if success:
+                    messagebox.showinfo("Success", "Model loaded successfully!")
+                    event_bus.publish('scene_updated')
+                else:
+                    messagebox.showerror("Error", "Failed to load model")
+            self.root.after(0, update_ui)
+        
+        threading.Thread(target=load_task, daemon=True).start()
+    
+    def load_trajectory(self):
+        """Load trajectory in background"""
+        filepath = filedialog.askopenfilename(
+            title="Select Trajectory File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not filepath:
+            return
+        
+        def load_task():
+            try:
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+                waypoints = []
+                for i, wp_data in enumerate(data.get('waypoints', [])):
+                    wp = Waypoint.from_dict(wp_data, i)
+                    waypoints.append(wp)
+                logger.info(f"Parsed {len(waypoints)} waypoints from {filepath}")
+                
+                def update_ui():
+                    if not waypoints:
+                        messagebox.showerror("Error", "Failed to parse trajectory file")
+                        return
+                    name = Path(filepath).stem
+                    color = (np.random.rand(), np.random.rand(), np.random.rand())
+                    trajectory = Trajectory(name, waypoints, color)
+                    self.trajectories.append(trajectory)
+                    self.selected_trajectory = trajectory
+                    self.selected_waypoint = None
+                    event_bus.publish('trajectory_updated')
+                    messagebox.showinfo("Success", f"Loaded trajectory with {len(waypoints)} waypoints")
+                
+                self.root.after(0, update_ui)
+            except Exception as e:
+                logger.error(f"Error loading trajectory: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load trajectory: {e}"))
+        
+        threading.Thread(target=load_task, daemon=True).start()
+    
+    def save_trajectory(self):
+        """Save current trajectory"""
+        if not self.selected_trajectory:
+            messagebox.showwarning("Warning", "No trajectory selected")
+            return
+            
+        filepath = filedialog.asksaveasfilename(
+            title="Save Trajectory",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        
+        if not filepath:
+            return
+            
+        try:
+            data = {'waypoints': [wp.to_dict() for wp in self.selected_trajectory.waypoints]}
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=4)
+            messagebox.showinfo("Success", "Trajectory saved successfully!")
+        except Exception as e:
+            logger.error(f"Error saving trajectory: {e}")
+            messagebox.showerror("Error", f"Failed to save trajectory: {e}")
+    
+    def toggle_ground_plane(self):
+        """Toggle ground plane visibility"""
+        try:
+            is_visible = self.scene.toggle_ground_plane()
+            event_bus.publish('scene_updated')
+            status = "visible" if is_visible else "hidden"
+            messagebox.showinfo("Ground Plane", f"Ground plane is now {status}")
+        except Exception as e:
+            logger.error(f"Error toggling ground plane: {e}")
+    
+    def compare_trajectories(self):
+        """Compare multiple trajectories"""
+        if len(self.trajectories) < 2:
+            messagebox.showwarning("Warning", "Need at least 2 trajectories to compare")
+            return
+            
+        try:
+            compare_window = tk.Toplevel(self.root)
+            compare_window.title("Trajectory Comparison")
+            compare_window.geometry("800x600")
+            
+            text_widget = tk.Text(compare_window, wrap=tk.WORD)
+            scrollbar = ttk.Scrollbar(compare_window, orient=tk.VERTICAL, command=text_widget.yview)
+            text_widget.configure(yscrollcommand=scrollbar.set)
+            
+            text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            comparison_data = []
+            for traj in self.trajectories:
+                metrics = traj.calculate_metrics()
+                comparison_data.append({
+                    'name': traj.name,
+                    'metrics': metrics
+                })
+            
+            most_efficient = min(comparison_data, key=lambda x: x['metrics']['total_duration'])
+            
+            text_widget.insert(tk.END, "TRAJECTORY COMPARISON\n")
+            text_widget.insert(tk.END, "=" * 50 + "\n\n")
+            
+            header = f"{'Name':<20} {'Length(m)':<12} {'Vertical(m)':<12} {'Duration(s)':<12} {'Waypoints':<10}\n"
+            text_widget.insert(tk.END, header)
+            text_widget.insert(tk.END, "-" * 70 + "\n")
+            
+            for data in comparison_data:
+                metrics = data['metrics']
+                is_best = " (BEST)" if data['name'] == most_efficient['name'] else ""
+                row = (f"{data['name']:<20} {metrics['total_length']:<12.2f} "
+                       f"{metrics['total_vertical']:<12.2f} {metrics['total_duration']:<12.2f} "
+                       f"{metrics['num_waypoints']:<10} {is_best}\n")
+                text_widget.insert(tk.END, row)
+            
+            text_widget.insert(tk.END, f"\nMost efficient: {most_efficient['name']}")
+            
+        except Exception as e:
+            logger.error(f"Error comparing trajectories: {e}")
+            messagebox.showerror("Error", f"Failed to compare trajectories: {e}")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        try:
+            self.main_renderer.cleanup()
+            self.fpv_renderer.cleanup()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
+def main():
+    """Main entry point"""
+    root = tk.Tk()
+    app = UAVVisualizationApp(root)
+    
+    def on_closing():
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            app.cleanup()
+            root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+    finally:
+        app.cleanup()
 
-# -----------------------------
-# Main application entry point
-# -----------------------------
-if __name__ == "__main__":
-    QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-    app = QApplication(sys.argv)
-
-    config = load_app_config("config.yml")
-    vis = VisualizationSystem(config)
-    window = ViewerApp(vis, config)
-    window.show()
-    sys.exit(app.exec_())
+if __name__ == '__main__':
+    main()
