@@ -10,3 +10,5 @@
 # R history
 .Rhistory
 
+*.obj
+*.ply
