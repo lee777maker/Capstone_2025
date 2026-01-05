@@ -1,0 +1,9 @@
+# Core libraries
+PyOpenGL>=3.1.6       # OpenGL bindings for Python
+numpy>=1.26.2          # Array processing
+trimesh>=3.22.0        # 3D mesh processing
+cmasher>=2.1.0         # Scientific colormaps
+matplotlib>=3.8.0      # Plotting library
+
+# Standard library (ctypes is built-in, no need to install)
+# ctypes

@@ -1,0 +1,14 @@
+scene_id: 2
+width_px: 5472
+height_px: 3648
+focal_length_mm: 8.8
+sensor_size_mm: 13.2
+target_voxel_size: 0.1
+candi_pos_voxel_size: 0.1
+min_pitch: -90
+max_pitch: 15
+min_altitude: 2.0
+preferred_distance: 10
+safe_distance: 5
+dataset_path: "./models"
+scene_name: Kiri_Vehera_SriLanka
