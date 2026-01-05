@@ -30,7 +30,14 @@ A comprehensive 3D visualization system for Unmanned Aerial Vehicle (UAV) flight
 - **Python**: Version 3.11 or newer
 - **Memory**: 4GB RAM minimum, 8GB recommended
 - **Graphics**: Dedicated GPU with OpenGL 3.3+ support
-
+- 
 ### Dependencies Installation
-```bash
-pip install open3d trimesh numpy scipy opencv-python pillow glfw
+pip install open3d trimesh numpy scipy opencv-python pillow glfw```
+  
+### Grade: 74.5%
+
+### Contact for more information.
+
+
+
+
