@@ -1,0 +1,267 @@
+@startuml
+' Enable orthogonal (angular) lines
+skinparam linetype ortho
+' Clear box styling with sufficient padding and contrast
+skinparam class {
+  BackgroundColor White
+  BorderColor Black
+  ArrowColor Black
+  FontColor Black
+  FontSize 12
+  AttributeFontSize 10
+  Padding 10
+  Margin 10
+}
+skinparam classAttributeIconSize 0
+skinparam defaultTextAlignment left
+
+' Classes
+class UAVVisualizationApp {
+  -root: tk.Tk
+  -scene: Scene3D
+  -camera: Camera3D
+  -trajectories: List[Trajectory]
+  -selected_trajectory: Trajectory
+  -selected_waypoint: int
+  -video_recorder: VideoRecorder
+  -flight_manager: FlightManager
+  -update_loop_manager: ImprovedUpdateLoop
+  -camera_x: tk.DoubleVar
+  -camera_y: tk.DoubleVar
+  -camera_z: tk.DoubleVar
+  -camera_yaw: tk.DoubleVar
+  -camera_pitch: tk.DoubleVar
+  -fpv_distance: tk.DoubleVar
+  -fpv_zoom: tk.DoubleVar
+  -show_all_waypoints: tk.BooleanVar
+  -simulation_speed: tk.DoubleVar
+  +__init__(root: tk.Tk)
+  +setup_gui()
+  +setup_control_panel(parent)
+  +setup_3d_view(parent)
+  +setup_info_panel(parent)
+  +clear_all_trajectories()
+  +load_model()
+  +load_trajectory()
+  +save_trajectory()
+  +on_fps_change(*args)
+  +on_show_all_toggle(*args)
+  +update_trajectory_visualization()
+  +generate_camera_visualization(position, yaw, pitch, scale, color)
+  +on_fpv_distance_change(*args)
+  +on_fpv_zoom_change(*args)
+  +open_camera_window()
+  +on_camera_slider(*args)
+  +toggle_recording()
+  +add_waypoint()
+  +edit_waypoint()
+  +delete_waypoint()
+  +on_waypoint_select(event)
+  +update_waypoint_list()
+  +compare_trajectories()
+  +compare_interpolations()
+  +update_interpolation()
+  +on_speed_change(*args)
+  +toggle_pause()
+  +start_simulation(filepath, fps, resolution)
+  +stop_simulation()
+  +on_canvas_resize(event)
+  +on_fpv_resize(event)
+  +on_mouse_press(event)
+  +on_mouse_drag(event)
+  +on_mouse_release(event)
+  +on_mouse_wheel(event)
+  +on_key_press(event)
+  +on_key_release(event)
+  +show_keyboard_help()
+  +add_waypoint_from_current_camera()
+  +close()
+}
+
+class CollapsibleFrame {
+  -show: tk.BooleanVar
+  -text: str
+  -title_frame: ttk.Frame
+  -toggle_button: ttk.Button
+  -content_frame: ttk.Frame
+  +__init__(parent, text, **kwargs)
+  +toggle()
+  +get_content_frame()
+}
+
+class Waypoint {
+  -position: np.ndarray
+  -yaw: float
+  -pitch: float
+  -index: int
+  +__init__(position: np.ndarray, yaw: float, pitch: float, index: int)
+  +to_dict()
+  +from_dict(data: Dict, index: int)
+}
+
+class Trajectory {
+  -name: str
+  -waypoints: List[Waypoint]
+  -color: Tuple[float, float, float]
+  -interpolation_method: InterpolationMethod
+  -_cached_paths: Dict[str, np.ndarray]
+  -_cache_key: int
+  +__init__(name: str, waypoints: List[Waypoint], color: Tuple[float, float, float], interpolation_method: InterpolationMethod)
+  +get_positions()
+  +_make_cache_key()
+  +calculate_metrics(cruising_speed: float, hover_time: float)
+  +calculate_detailed_metrics(cruising_speed: float)
+  +calculate_efficiency_rating(metrics)
+}
+
+class TrajectoryParser {
+  +parse_json(filepath: str)
+  +save_json(filepath: str, waypoints: List[Waypoint])
+}
+
+class TrajectoryInterpolator {
+  +interpolate_linear(waypoints: List[Waypoint], num_points: int)
+  +interpolate_spline(waypoints: List[Waypoint], num_points: int)
+  +_cumdist_np(positions: np.ndarray)
+}
+
+enum InterpolationMethod {
+  LINEAR
+  SPLINE
+}
+
+class Camera3D {
+  -position: np.ndarray
+  -yaw: float
+  -pitch: float
+  -fov: float
+  +__init__()
+  +set_from_waypoint(waypoint: Waypoint)
+}
+
+class Open3DRenderThread {
+  -width: int
+  -height: int
+  -name: str
+  -_cmd_queue: queue.Queue
+  -_frame_callbacks: List[Callable]
+  -_callback_lock: threading.Lock
+  -_should_stop: threading.Event
+  -_geometry_dirty: threading.Event
+  -_camera_dirty: threading.Event
+  -_resize_dirty: threading.Event
+  -_geometries: List[Geometry]
+  -_camera_params: Dict
+  -_new_size: Tuple[int, int]
+  -vis: o3d.Visualizer
+  +__init__(width: int, height: int, name: str)
+  +add_frame_callback(callback: Callable)
+  +remove_frame_callback(callback: Callable)
+  +set_geometries(geometries: list)
+  +set_camera(params: dict)
+  +resize(width: int, height: int)
+  +stop()
+  +run()
+}
+
+class RenderManager {
+  -renderers: Dict[str, Open3DRenderThread]
+  -_frame_queue: queue.Queue
+  +__init__()
+  +create_renderer(name: str, width: int, height: int)
+  +stop_renderer(name: str)
+  +stop_all()
+  +get_frame(timeout: float)
+}
+
+class ImprovedUpdateLoop {
+  -app: UAVVisualizationApp
+  -render_manager: RenderManager
+  -main_renderer: Open3DRenderThread
+  -fpv_renderer: Open3DRenderThread
+  -_main_frame_queue: queue.Queue
+  -_fpv_frame_queue: queue.Queue
+  +__init__(app_instance)
+  +start()
+  +stop()
+  +update_main_geometries(geometries)
+  +update_fpv_geometries(geometries)
+  +update_main_camera(params)
+  +update_fpv_camera(params)
+  +resize_main(width, height)
+  +resize_fpv(width, height)
+}
+
+class Scene3D {
+  -model_trimesh: trimesh.Trimesh
+  -bounds: np.ndarray
+  -o3d_mesh: o3d.TriangleMesh
+  -o3d_geometries: List[o3d.Geometry]
+  -ground_plane: o3d.TriangleMesh
+  -show_ground_plane: bool
+  +__init__()
+  +load_model(filepath: str)
+  +get_trimesh_components()
+}
+
+class FlightManager {
+  -app: UAVVisualizationApp
+  -flight_simulation_active: bool
+  -flight_animation_id: int
+  -current_flight_position: float
+  -interpolated_path: np.ndarray
+  -flight_speed_factor: tk.DoubleVar
+  -flight_paused: bool
+  -cruising_speed: tk.DoubleVar
+  -hover_time: tk.DoubleVar
+  +__init__(app_instance)
+  +get_progress_bar()
+  +start_flight_simulation()
+  +pause_flight_simulation()
+  +resume_flight_simulation()
+  +stop_flight_simulation()
+  +animate_flight()
+}
+
+class VideoRecorder {
+  -output_path: str
+  -fps: int
+  -resolution: Tuple[int, int]
+  -writer: cv2.VideoWriter
+  -is_recording: bool
+  -frame_source: str
+  +__init__(output_path: str, fps: int, resolution: Tuple[int, int])
+  +start_recording()
+  +add_frame(frame: np.ndarray)
+  +stop_recording()
+}
+
+' Relationships
+UAVVisualizationApp o--> "1" Scene3D
+UAVVisualizationApp o--> "1" Camera3D
+UAVVisualizationApp o--> "*" Trajectory
+UAVVisualizationApp o--> "1" VideoRecorder
+UAVVisualizationApp o--> "1" FlightManager
+UAVVisualizationApp o--> "1" ImprovedUpdateLoop
+UAVVisualizationApp --> TrajectoryParser : uses
+UAVVisualizationApp --> CollapsibleFrame : uses
+Trajectory o--> "*" Waypoint
+Trajectory --> TrajectoryInterpolator : uses
+Trajectory --> InterpolationMethod : uses
+Waypoint --> TrajectoryParser : uses
+Camera3D --> Waypoint : uses
+ImprovedUpdateLoop o--> "1" RenderManager
+ImprovedUpdateLoop o--> "1" Open3DRenderThread : main_renderer
+ImprovedUpdateLoop o--> "1" Open3DRenderThread : fpv_renderer
+RenderManager o--> "*" Open3DRenderThread
+FlightManager --> Trajectory : uses
+FlightManager --> TrajectoryInterpolator : uses
+VideoRecorder --> ImprovedUpdateLoop : uses
+Scene3D --> Open3D : uses
+Scene3D --> trimesh : uses
+Open3DRenderThread --> Open3D : uses
+CollapsibleFrame --|> ttk.Frame
+Open3DRenderThread --|> threading.Thread
+InterpolationMethod --|> Enum
+
+@enduml

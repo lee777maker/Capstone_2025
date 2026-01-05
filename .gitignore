@@ -1,0 +1,12 @@
+# Large 3D / UAV mesh files
+*.obj
+*.ply
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.synctex.gz
+
+# R history
+.Rhistory
+

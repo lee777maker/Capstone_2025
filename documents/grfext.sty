@@ -1,0 +1,13 @@
+%%
+%% grfext.sty
+%% Minimal version for epstopdf compatibility
+%%
+\ProvidesPackage{grfext}[2016/05/16 v1.2 Manage graphics extensions]
+\RequirePackage{kvdefinekeys}
+\newcommand\Gext@add[2]{%
+  \edef\Gin@extensions{\Gin@extensions,#1}%
+}
+\newcommand\AppendGraphicsExtensions[1]{\Gext@add{#1}{}}
+\newcommand\PrependGraphicsExtensions[1]{\Gext@add{#1}{}}
+\endinput
+

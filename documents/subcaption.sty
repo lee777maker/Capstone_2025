@@ -1,0 +1,38 @@
+%% subcaption.sty
+%% This file is part of the `subcaption` package on CTAN.
+%% Maintainer: Axel Sommerfeldt <axel.sommerfeldt@freenet.de>
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{subcaption}[2023/01/27 v1.4 Sub-captions (AS)]
+
+\RequirePackage{caption}[2020/11/13]
+
+\DeclareCaptionOption{list=false}[]{\caption@setbool{list}{false}}
+
+\DeclareCaptionOption{list=true}[]{\caption@setbool{list}{true}}
+
+\DeclareCaptionOption{listformat}[simple]{%
+  \def\caption@listformat{#1}}
+
+\newcommand\subcaption[2][]{%
+  \begingroup
+    \let\caption@lstfmt\caption@listformat
+    \def\caption@listformat{simple}%
+    \caption[#1]{#2}%
+  \endgroup}
+
+\newenvironment{subfigure}[2][]{%
+  \begin{minipage}{#2}%
+  \captionsetup{#1}%
+}{%
+  \end{minipage}%
+}
+
+\newenvironment{subtable}[2][]{%
+  \begin{minipage}{#2}%
+  \captionsetup{#1}%
+}{%
+  \end{minipage}%
+}
+
+\endinput
+
