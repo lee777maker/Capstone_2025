@@ -2,7 +2,11 @@
 
 A comprehensive 3D visualization system for Unmanned Aerial Vehicle (UAV) flight trajectories, designed for photogrammetric surveying of cultural heritage sites and structural inspection missions.
 
-![UAV Visualization System](Screenshot.png)
+<h3 align="center">Sydney Opera House</h3>
+<p align="center">
+  <img src="documents/C1.png" alt="Opera-House" width="900" />
+</p>
+
 
 ## Features
 
@@ -22,7 +26,11 @@ A comprehensive 3D visualization system for Unmanned Aerial Vehicle (UAV) flight
 - **Multi-threaded Rendering**: Non-blocking UI during intensive operations
 - **Batch Operations**: Efficient handling of hundreds of waypoints
 - **Flexible Camera Controls**: Adjustable FPV distance and zoom
-
+- 
+<h3 align="center">Flight Paths</h3>
+<p align="center">
+  <img src="documents/A1.png" alt="Flight-Path" width="900" />
+</p>
 ## Installation
 
 ### System Requirements
